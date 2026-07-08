@@ -2753,37 +2753,61 @@ app.registerExtension({
                 };
 
                 // Queue 按钮拦截：每次点击时将当前选中快照推入后端 FIFO 队列
+                // 用具名 handler 以便节点移除/被 mute 时摘除监听器，避免"幽灵拦截器"
+                // 在画廊被关闭后仍凭旧选区污染队列（导致新画廊选的图片与输出提示词错位）。
+                const queueBtnListener = async (ev) => {
+                    // 防御 1：只响应最后活跃的画廊节点，其他画廊跳过
+                    if (window.__lastActiveGalleryNodeId !== nodeInstanceId) return;
+                    // 防御 2：本节点的图片网格已脱离文档（节点被删除/被开关节点关闭），
+                    // 即使监听器还在也不能凭旧选区 push —— 这是错位 bug 的根因。
+                    // imageGrid 是本节点 widget 内的 DOM，节点从画布移除后它会被LiteGraph detach。
+                    if (!imageGrid || !document.body.contains(imageGrid)) return;
+                    const selectedWrappers = imageGrid.querySelectorAll('.danbooru-image-wrapper.selected');
+                    if (selectedWrappers.length === 0) return;
+                    const selections = [];
+                    for (const wrapper of selectedWrappers) {
+                        const postId = wrapper.dataset.postId;
+                        const postData = posts.find(p => p.id == postId) || temporaryTagEdits[postId];
+                        if (postData) {
+                            const prompt = buildPromptForPost(postData);
+                            const mediaPost = getPostWithOriginalMedia(postData);
+                            const imageUrl = getBestImageUrl(mediaPost, false);
+                            selections.push({ post_id: postId, prompt, image_url: imageUrl });
+                        }
+                    }
+                    if (selections.length === 0) return;
+                    selectionQueueId++;
+                    logger.info(`[QueueBtn] push ${selections.length}条 nodeId=${nodeInstanceId} queueId=${selectionQueueId}`);
+                    await fetch("/danbooru_gallery/selection_queue_push", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ item: { selections, _queue_id: selectionQueueId, nodeId: nodeInstanceId }, nodeId: nodeInstanceId })
+                    });
+                };
+                let _qBtn = null;
                 const _hookQueueButton = () => {
                     // 兼容不同 ComfyUI 前端版本：data-testid（新版）/ #comfy-queue-btn（旧版）
                     const queueBtn = document.querySelector('[data-testid="queue-button"]') || document.getElementById("comfy-queue-btn");
                     if (!queueBtn) { setTimeout(_hookQueueButton, 500); return; }
-                    queueBtn.addEventListener("click", async () => {
-                        // 只处理最后活跃的节点，其他画廊节点跳过
-                        if (window.__lastActiveGalleryNodeId !== nodeInstanceId) return;
-                        const selectedWrappers = imageGrid.querySelectorAll('.danbooru-image-wrapper.selected');
-                        if (selectedWrappers.length === 0) return;
-                        const selections = [];
-                        for (const wrapper of selectedWrappers) {
-                            const postId = wrapper.dataset.postId;
-                            const postData = posts.find(p => p.id == postId) || temporaryTagEdits[postId];
-                            if (postData) {
-                                const prompt = buildPromptForPost(postData);
-                                const mediaPost = getPostWithOriginalMedia(postData);
-                                const imageUrl = getBestImageUrl(mediaPost, false);
-                                selections.push({ post_id: postId, prompt, image_url: imageUrl });
-                            }
-                        }
-                        if (selections.length === 0) return;
-                        selectionQueueId++;
-                        logger.info(`[QueueBtn] push ${selections.length}条 nodeId=${nodeInstanceId} queueId=${selectionQueueId}`);
-                        await fetch("/danbooru_gallery/selection_queue_push", {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ item: { selections, _queue_id: selectionQueueId, nodeId: nodeInstanceId }, nodeId: nodeInstanceId })
-                        });
-                    }, true); // useCapture = true：在原始 onclick 之前触发
+                    _qBtn = queueBtn;
+                    // capture = true：在原始 onclick 之前触发，保证选区先入队
+                    queueBtn.addEventListener("click", queueBtnListener, true);
                 };
                 setTimeout(_hookQueueButton, 1000);
+                // 节点销毁/被关闭时摘除自己的 Queue 监听器，避免幽灵拦截器残留
+                const _unbindQueueListener = () => {
+                    try {
+                        if (_qBtn && queueBtnListener) _qBtn.removeEventListener("click", queueBtnListener, true);
+                    } catch (_) {}
+                    _qBtn = null;
+                    // 若本节点曾是最后活跃节点，清掉全局指针，避免后续被错误比对
+                    if (window.__lastActiveGalleryNodeId === nodeInstanceId) {
+                        window.__lastActiveGalleryNodeId = null;
+                    }
+                };
+                // 把清理回调挂在节点实例上，供 prototype 级 onRemoved 调用
+                // （onRemoved 是 prototype 方法，闭包级 closure 它拿不到，故走实例字段）
+                this._danbooruQueueUnbind = _unbindQueueListener;
 
                 // 2 秒定时轮询检查前方缓冲，不够就自动补货
                 setInterval(() => {
@@ -4441,6 +4465,10 @@ app.registerExtension({
                     ".danbooru-settings-dialog, .danbooru-edit-panel, .danbooru-tag-tooltip, .danbooru-tag-context-menu, .danbooru-toast"
                 );
                 elementsToRemove.forEach(el => el.remove());
+
+                // 摘除本实例挂的全局 Queue 按钮监听器，避免"幽灵拦截器"残留
+                // 残留会在节点被关闭后仍凭旧选区污染队列（错位 bug 根因）
+                try { if (typeof this._danbooruQueueUnbind === 'function') this._danbooruQueueUnbind(); } catch (_) {}
 
                 // 调用原始的 onRemoved 方法
                 onRemoved?.apply(this, arguments);
