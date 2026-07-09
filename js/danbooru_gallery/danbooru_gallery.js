@@ -12,6 +12,78 @@ const logger = createLogger('danbooru_gallery');
 // 打开全局日志，所有级别打到 ComfyUI 终端
 loggerClient.setConsoleOutput(true);
 
+// ============================================================
+// 画廊节点选区 → Queue 按钮 全局注册表（方案 C）
+// ------------------------------------------------------------
+// 历史问题：每个画廊节点实例一创建就给全局"运行(Queue)"按钮挂一个 click
+// 监听器，节点被"组忽略管理器"等开关节点 bypass(mode=4) 或删除后，
+// 旧监听器仍残留，凭关闭那一刻的旧选区继续往后端 FIFO 队列 push，
+// 导致后续新画廊选中的图片与实际输出的提示词错位（幽灵拦截器 bug）。
+//
+// 方案 C：整个模块只挂【一个】永久 Queue 按钮监听器（模块初始化时挂一次，
+// 不属于任何节点）。点运行时，它去全局注册表里找"当前活跃且存活"的那个
+// 画廊，要它的实时选区，塞它的桶。节点 bypass/删除时把自己从注册表摘掉，
+// 运行按钮监听器根本不会替它塞桶，旧数据无法污染。
+// ============================================================
+
+// 全局注册表：nodeInstanceId → 节点句柄
+const galleryRegistry = new Map();
+// 当前活跃画廊的 nodeInstanceId（最近一次在画廊上交互的那个）
+let activeGalleryNodeId = null;
+// Queue 按钮监听器是否已挂（全模块只挂一次）
+let _queueListenerInstalled = false;
+
+/**
+ * 把选区快照塞进后端 FIFO 队列（按 nodeId 分桶）。
+ * @param {string} nodeId - 画廊节点实例ID
+ * @param {Array} selections - 选区数组 [{post_id, prompt, image_url}]
+ * @param {number} queueId - 本次 push 的队列序号
+ */
+async function _pushSelectionToQueue(nodeId, selections, queueId) {
+    try {
+        await fetch("/danbooru_gallery/selection_queue_push", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ item: { selections, _queue_id: queueId, nodeId }, nodeId })
+        });
+        logger.info(`[QueueBtn] push ${selections.length}条 nodeId=${nodeId} queueId=${queueId}`);
+    } catch (e) {
+        logger.warn(`[QueueBtn] push 失败 nodeId=${nodeId}:`, e);
+    }
+}
+
+/**
+ * 安装全局 Queue 按钮监听器（全模块只挂一次）。
+ * 兼容新版 [data-testid="queue-button"] 与旧版 #comfy-queue-btn。
+ * 运行按钮可能晚于本模块加载才出现，故轮询直到挂上。
+ */
+function _installGlobalQueueListener() {
+    if (_queueListenerInstalled) return;
+    const tryInstall = () => {
+        const queueBtn = document.querySelector('[data-testid="queue-button"]') || document.getElementById("comfy-queue-btn");
+        if (!queueBtn) { setTimeout(tryInstall, 500); return; }
+        // capture=true：在原始 onclick 之前触发，保证选区先入队再真正运行
+        queueBtn.addEventListener("click", async () => {
+            // 取当前活跃画廊句柄
+            const handle = activeGalleryNodeId ? galleryRegistry.get(activeGalleryNodeId) : null;
+            if (!handle) return; // 没有存活活跃画廊 → 不 push（关键：旧画廊已摘，不会被命中）
+            // 存活判定：句柄自报 isAlive()。bypass(mode=4)/删除/DOM脱离 都算不存活
+            try { if (!handle.isAlive()) return; } catch (_) { return; }
+            // 取实时选区
+            let selections = [];
+            try { selections = handle.getSelections() || []; } catch (_) { return; }
+            if (selections.length === 0) return;
+            handle.queueCounter = (handle.queueCounter || 0) + 1;
+            await _pushSelectionToQueue(handle.nodeInstanceId, selections, handle.queueCounter);
+        }, true);
+        _queueListenerInstalled = true;
+        logger.info("[QueueBtn] 全局运行按钮监听器已安装（单例）");
+    };
+    tryInstall();
+}
+// 模块加载即尝试安装（运行按钮没出现会轮询）
+_installGlobalQueueListener();
+
 app.registerExtension({
     name: "Comfy.DanbooruGallery",
     async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -199,7 +271,11 @@ app.registerExtension({
                 let selectionQueueId = 0; // FIFO 队列唯一 ID 计数器
                 const nodeInstanceId = crypto.randomUUID ? crypto.randomUUID() : 'node_' + Math.random().toString(36).slice(2, 10);
                 // 标记自己为最后活跃节点（自己节点上的任何交互都更新全局指针）
-                const markActive = () => { window.__lastActiveGalleryNodeId = nodeInstanceId; };
+                // 方案C：activeGalleryNodeId 是全局注册表的活跃指针，点运行时只认它
+                const markActive = () => {
+                    activeGalleryNodeId = nodeInstanceId;
+                    window.__lastActiveGalleryNodeId = nodeInstanceId; // 兼容旧引用
+                };
                 let filterState = { startTime: null, endTime: null, startPage: null };
                 let userAuth = { username: "", api_key: "", has_auth: false, gelbooru_user_id: "", gelbooru_api_key: "", gelbooru_has_auth: false }; // 用户认证信息
                 let userFavorites = []; // 用户收藏列表，确保字符串
@@ -2752,18 +2828,17 @@ app.registerExtension({
                     }
                 };
 
-                // Queue 按钮拦截：每次点击时将当前选中快照推入后端 FIFO 队列
-                // 用具名 handler 以便节点移除/被 mute 时摘除监听器，避免"幽灵拦截器"
-                // 在画廊被关闭后仍凭旧选区污染队列（导致新画廊选的图片与输出提示词错位）。
-                const queueBtnListener = async (ev) => {
-                    // 防御 1：只响应最后活跃的画廊节点，其他画廊跳过
-                    if (window.__lastActiveGalleryNodeId !== nodeInstanceId) return;
-                    // 防御 2：本节点的图片网格已脱离文档（节点被删除/被开关节点关闭），
-                    // 即使监听器还在也不能凭旧选区 push —— 这是错位 bug 的根因。
-                    // imageGrid 是本节点 widget 内的 DOM，节点从画布移除后它会被LiteGraph detach。
-                    if (!imageGrid || !document.body.contains(imageGrid)) return;
+                // ============================================================
+                // 方案 C：本节点不再直接挂 Queue 按钮监听器，而是把自己注册到全局
+                // galleryRegistry，由模块级单例监听器在点运行时统一调度。
+                // 节点 bypass(mode=4)/删除/DOM脱离 时 isAlive() 返回 false，
+                // 监听器就不会替它塞桶 → 旧选区无法污染后续运行。
+                // ============================================================
+                // 取本节点当前选区的实时快照（复用已有 updateSelectionData 的逻辑）
+                const _getSelectionsSnapshot = () => {
+                    if (!imageGrid || !document.body.contains(imageGrid)) return [];
                     const selectedWrappers = imageGrid.querySelectorAll('.danbooru-image-wrapper.selected');
-                    if (selectedWrappers.length === 0) return;
+                    if (selectedWrappers.length === 0) return [];
                     const selections = [];
                     for (const wrapper of selectedWrappers) {
                         const postId = wrapper.dataset.postId;
@@ -2775,39 +2850,39 @@ app.registerExtension({
                             selections.push({ post_id: postId, prompt, image_url: imageUrl });
                         }
                     }
-                    if (selections.length === 0) return;
-                    selectionQueueId++;
-                    logger.info(`[QueueBtn] push ${selections.length}条 nodeId=${nodeInstanceId} queueId=${selectionQueueId}`);
-                    await fetch("/danbooru_gallery/selection_queue_push", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ item: { selections, _queue_id: selectionQueueId, nodeId: nodeInstanceId }, nodeId: nodeInstanceId })
-                    });
+                    return selections;
                 };
-                let _qBtn = null;
-                const _hookQueueButton = () => {
-                    // 兼容不同 ComfyUI 前端版本：data-testid（新版）/ #comfy-queue-btn（旧版）
-                    const queueBtn = document.querySelector('[data-testid="queue-button"]') || document.getElementById("comfy-queue-btn");
-                    if (!queueBtn) { setTimeout(_hookQueueButton, 500); return; }
-                    _qBtn = queueBtn;
-                    // capture = true：在原始 onclick 之前触发，保证选区先入队
-                    queueBtn.addEventListener("click", queueBtnListener, true);
-                };
-                setTimeout(_hookQueueButton, 1000);
-                // 节点销毁/被关闭时摘除自己的 Queue 监听器，避免幽灵拦截器残留
-                const _unbindQueueListener = () => {
+                // 存活判定：节点未被删除(DOM还在) 且 未被 bypass(mode!=4)
+                const _isAlive = () => {
                     try {
-                        if (_qBtn && queueBtnListener) _qBtn.removeEventListener("click", queueBtnListener, true);
-                    } catch (_) {}
-                    _qBtn = null;
-                    // 若本节点曾是最后活跃节点，清掉全局指针，避免后续被错误比对
-                    if (window.__lastActiveGalleryNodeId === nodeInstanceId) {
+                        if (!nodeInstance || nodeInstance.mode === 4) return false; // 4 = LiteGraph.BYPASS
+                        if (!imageGrid || !document.body.contains(imageGrid)) return false; // 已从画布移除
+                        return true;
+                    } catch (_) {
+                        return false;
+                    }
+                };
+                // 注册到全局表
+                galleryRegistry.set(nodeInstanceId, {
+                    nodeInstanceId,
+                    nodeInstance,
+                    isAlive: _isAlive,
+                    getSelections: _getSelectionsSnapshot,
+                    queueCounter: 0,
+                });
+                logger.info(`[QueueBtn] 画廊注册 nodeId=${nodeInstanceId}`);
+                // 摘除注册（节点删除时调用）；同时若是活跃节点则清指针
+                const _unregisterFromQueue = () => {
+                    if (galleryRegistry.get(nodeInstanceId)) {
+                        galleryRegistry.delete(nodeInstanceId);
+                        logger.info(`[QueueBtn] 画廊摘除注册 nodeId=${nodeInstanceId}`);
+                    }
+                    if (activeGalleryNodeId === nodeInstanceId) {
+                        activeGalleryNodeId = null;
                         window.__lastActiveGalleryNodeId = null;
                     }
                 };
-                // 把清理回调挂在节点实例上，供 prototype 级 onRemoved 调用
-                // （onRemoved 是 prototype 方法，闭包级 closure 它拿不到，故走实例字段）
-                this._danbooruQueueUnbind = _unbindQueueListener;
+                this._danbooruQueueUnbind = _unregisterFromQueue;
 
                 // 2 秒定时轮询检查前方缓冲，不够就自动补货
                 setInterval(() => {
